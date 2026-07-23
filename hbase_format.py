@@ -3,34 +3,42 @@
 HBase Read/Scan result formatter.
 
 Executes get/scan queries defined in a config file via `hbase shell`,
-parses the raw shell output, and renders one table row per HBase row key.
+parses the raw shell output, and renders the result as a table, CSV,
+or a vertical one-cell-per-line listing.
 
 Usage:
-    python hbase_format.py --table user_table --query scan_by_fileid --param val=xxx
+    python hbase_format.py --table user_table --namespace prod --query scan_all
     python hbase_format.py --table user_table --query get_by_key --param rowkey=row_key_1
-    python hbase_format.py --table user_table --from-file result.txt
+    python hbase_format.py --table user_table --from-file result.txt --vertical
     cat result.txt | python hbase_format.py --table user_table --from-file -
 
-Config file (default: config.json next to this script):
-{
-  "hbase_shell_cmd": "hbase shell -n",          // optional, this is the default
-  "tables": {
-    "user_table": {
-      "columns": ["cf1:col1", "cf1:col2"],
-      "queries": {
-        "get_by_key": "get 'user_table', '{rowkey}'",
-        "scan_all":   "scan 'user_table'"
-      }
-    }
-  }
-}
+Config file (default: config.yaml next to this script; JSON also accepted):
+
+    hbase_shell_cmd: hbase shell -n        # optional, this is the default
+    default_namespace: default             # used for '{namespace}' when
+                                           # --namespace is not passed
+    tables:
+      user_table:
+        # Columns: a YAML list, or a whitespace-separated block (handy
+        # for tables with hundreds of columns - no quotes or commas):
+        columns: >
+          cf1:col1 cf1:col2
+        queries:
+          get_by_key: get '{namespace}:user_table', '{rowkey}'
+          scan_all: scan '{namespace}:user_table'
+
+'{namespace}' in a query template is filled from --namespace, falling
+back to "default_namespace" in the config. Other '{name}' placeholders
+are filled from --param name=value.
 
 Parameter values are escaped for JRuby single-quoted strings before
 substitution, so quotes in a value cannot alter the query structure.
 Values substituted inside a regexstring comparator are still regexes:
 metacharacters in the value change what the filter matches.
 
-Stdlib only. Exit codes: 0 ok, 1 usage/config error, 2 query execution error.
+Requires PyYAML for YAML configs (pip install pyyaml); JSON configs
+work with the stdlib alone.
+Exit codes: 0 ok, 1 usage/config error, 2 query execution error.
 """
 
 import argparse
@@ -148,6 +156,21 @@ def render_table(rows, row_order, columns, missing="-"):
     return "\n".join(out)
 
 
+def render_vertical(rows, row_order, columns, missing="-"):
+    """Render one cell per line, one block per row key (like MySQL's \\G)."""
+    names = [display_name(c) for c in columns]
+    width = max(len(n) for n in names)
+    blocks = []
+    for rk in row_order:
+        lines = [f"ROW: {rk}"]
+        lines.extend(
+            f"  {name.ljust(width)} : {rows[rk].get(col, missing)}"
+            for col, name in zip(columns, names)
+        )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def render_csv(rows, row_order, columns, missing=""):
     import csv
     import io
@@ -201,10 +224,13 @@ def build_query(table_cfg, table_name, query_name, params):
 
     unfilled = sorted(set(placeholder.findall(query)) - set(params))
     if unfilled:
-        die(
-            f"Query '{query_name}' needs parameter(s): {', '.join(unfilled)}. "
-            f"Pass with --param name=value."
-        )
+        hints = []
+        if "namespace" in unfilled:
+            hints.append("Pass --namespace, or set \"default_namespace\" in the config.")
+            unfilled.remove("namespace")
+        if unfilled:
+            hints.append(f"Pass {', '.join(unfilled)} with --param name=value.")
+        die(f"Query '{query_name}' needs parameter(s). " + " ".join(hints))
     return query
 
 
@@ -242,32 +268,67 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+def default_config_path():
+    """First existing of config.yaml/.yml/.json next to the script,
+    else config.yaml (so the not-found error names the preferred file)."""
+    here = Path(__file__).parent
+    for name in ("config.yaml", "config.yml", "config.json"):
+        if (here / name).exists():
+            return str(here / name)
+    return str(here / "config.yaml")
+
+
 def load_config(path):
     p = Path(path)
     if not p.exists():
         die(f"Config file not found: {p}")
-    try:
-        cfg = json.loads(p.read_text())
-    except json.JSONDecodeError as e:
-        die(f"Invalid JSON in {p}: {e}")
-    if "tables" not in cfg:
+    text = p.read_text()
+    if p.suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            die("YAML configs need PyYAML: pip install pyyaml "
+                "(or use a .json config instead).")
+        try:
+            cfg = yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            die(f"Invalid YAML in {p}: {e}")
+    else:
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError as e:
+            die(f"Invalid JSON in {p}: {e}")
+    if not isinstance(cfg, dict) or "tables" not in cfg:
         die('Config must have a top-level "tables" object.')
     return cfg
 
 
+def normalize_columns(cols):
+    """Accept a list of columns or a whitespace-separated string block."""
+    if isinstance(cols, str):
+        return cols.split()
+    return list(cols)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Execute and format HBase get/scan results.")
-    ap.add_argument("--config", default=str(Path(__file__).parent / "config.json"),
-                    help="Path to config.json (default: next to this script)")
+    ap.add_argument("--config", default=default_config_path(),
+                    help="Path to config.yaml/.json (default: next to this script)")
     ap.add_argument("--table", required=True, help="Table name as defined in the config")
     ap.add_argument("--query", help="Query name from the config (optional if only one)")
+    ap.add_argument("--namespace", metavar="NAME",
+                    help="Value for '{namespace}' in query templates "
+                         "(default: \"default_namespace\" from the config)")
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                     help="Placeholder value for the query template (repeatable)")
     ap.add_argument("--from-file", metavar="FILE",
                     help="Skip execution; parse a captured result file instead ('-' for stdin)")
     ap.add_argument("--rowkey", default="row",
                     help="Row key label for 'get' results, which don't include one")
-    ap.add_argument("--csv", action="store_true", help="Output CSV instead of a text table")
+    fmt = ap.add_mutually_exclusive_group()
+    fmt.add_argument("--csv", action="store_true", help="Output CSV instead of a text table")
+    fmt.add_argument("--vertical", action="store_true",
+                     help="Output one cell per line, one block per row key")
     ap.add_argument("--timeout", type=int, default=120, help="Query timeout in seconds")
     args = ap.parse_args()
 
@@ -277,7 +338,7 @@ def main():
         die(f"Table '{args.table}' not in config. Available: {', '.join(tables)}")
     table_cfg = tables[args.table]
 
-    columns = table_cfg.get("columns")
+    columns = normalize_columns(table_cfg.get("columns") or [])
     if not columns:
         die(f"No \"columns\" defined for table '{args.table}' in config.")
 
@@ -287,6 +348,10 @@ def main():
             die(f"--param must be NAME=VALUE, got: {item}")
         k, v = item.split("=", 1)
         params[k] = v
+
+    namespace = args.namespace or cfg.get("default_namespace")
+    if namespace is not None:
+        params.setdefault("namespace", str(namespace))
 
     # If the user passed a rowkey param, reuse it as the label for get results.
     rowkey_label = params.get("rowkey", args.rowkey)
@@ -316,6 +381,8 @@ def main():
 
     if args.csv:
         print(render_csv(rows, row_order, columns))
+    elif args.vertical:
+        print(render_vertical(rows, row_order, columns))
     else:
         print(render_table(rows, row_order, columns))
 

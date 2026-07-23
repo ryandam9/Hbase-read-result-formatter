@@ -1,0 +1,27 @@
+# HBase result formatter configuration.
+#
+# Table names in queries use the '{namespace}' placeholder so the same
+# config works across environments: pass --namespace at run time, or set
+# default_namespace below.
+
+hbase_shell_cmd: hbase shell -n
+default_namespace: default
+
+tables:
+  user_table:
+    # Columns can be a whitespace-separated block (easiest for wide
+    # tables - no quotes, commas, or dashes needed) ...
+    columns: >
+      cf1:col1 cf1:col2 cf1:col3
+    queries:
+      get_by_key: get '{namespace}:user_table', '{rowkey}'
+      scan_all: scan '{namespace}:user_table'
+
+  file_table:
+    # ... or a regular YAML list.
+    columns:
+      - cf1:fileId
+      - cf1:col1
+      - cf1:col2
+    queries:
+      scan_by_fileid: scan '{namespace}:file_table', {FILTER=>"SingleColumnValueFilter('cf1','fileId',=,'regexstring:.*{val}.*', true, true)"}
