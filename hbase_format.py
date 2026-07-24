@@ -401,40 +401,90 @@ def resolve_columns(spec, groups, available):
     return deduped
 
 
+EXAMPLES = """\
+examples:
+  # run a configured scan against the prod namespace
+  %(prog)s --table user_table --namespace prod --query scan_all
+
+  # fetch one row key
+  %(prog)s --table user_table --query get_by_key --param rowkey=row_key_1
+
+  # fetch several row keys in a single hbase shell session
+  %(prog)s --table user_table --query get_by_key \\
+      --param rowkey=rk1 --param rowkey=rk2 --param rowkey=rk3
+
+  # show only the populated cells of each row, one cell per line
+  %(prog)s --table user_table --query get_by_key --param rowkey=rk1 \\
+      --all-columns --vertical --skip-missing
+
+  # pick columns at run time (bare names, cf:qualifier, or config groups)
+  %(prog)s --table user_table --query scan_all --columns col1,basic
+
+  # format previously captured shell output instead of running hbase
+  cat result.txt | %(prog)s --table user_table --from-file -
+"""
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Execute and format HBase get/scan results.")
-    ap.add_argument("--config", default=default_config_path(),
-                    help="Path to config.yaml/.json (default: next to this script)")
-    ap.add_argument("--table", required=True, help="Table name as defined in the config")
-    ap.add_argument("--query", help="Query name from the config (optional if only one)")
-    ap.add_argument("--namespace", metavar="NAME",
-                    help="Value for '{namespace}' in query templates "
-                         "(default: \"default_namespace\" from the config)")
-    ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
-                    help="Placeholder value for the query template. Repeat one "
-                         "name with different values (e.g. several rowkeys) to "
-                         "run the query once per value in a single shell session.")
-    ap.add_argument("--from-file", metavar="FILE",
-                    help="Skip execution; parse a captured result file instead ('-' for stdin)")
-    ap.add_argument("--rowkey", default="row",
-                    help="Row key label for 'get' results, which don't include one")
-    ap.add_argument("--columns", metavar="A,B,...",
-                    help="Comma-separated column names (family prefix optional "
-                         "if unambiguous) and/or column group names to display")
-    ap.add_argument("--all-columns", action="store_true",
-                    help="Show every column found in the result, ignoring the "
-                         "configured column list")
-    fmt = ap.add_mutually_exclusive_group()
-    fmt.add_argument("--csv", action="store_true", help="Output CSV instead of a text table")
-    fmt.add_argument("--vertical", action="store_true",
-                     help="Output one cell per line, one block per row key")
-    ap.add_argument("--skip-missing", action="store_true",
-                    help="Vertical mode: omit columns a row has no value for")
-    ap.add_argument("--timeout", type=int, default=120,
-                    help="Timeout in seconds for the whole shell session "
-                         "(covers all repeated-param queries)")
+    ap = argparse.ArgumentParser(
+        description="Run HBase get/scan queries defined in a config file and "
+                    "format the results as a table, CSV, or a vertical "
+                    "one-cell-per-line view.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    qry = ap.add_argument_group("query selection")
+    qry.add_argument("--config", default=default_config_path(), metavar="FILE",
+                     help="Config file, .yaml or .json (default: config.yaml "
+                          "next to this script)")
+    qry.add_argument("--table", required=True, metavar="NAME",
+                     help="Table name as defined in the config")
+    qry.add_argument("--query", metavar="NAME",
+                     help="Query name from the config (may be omitted when the "
+                          "table has exactly one query)")
+    qry.add_argument("--namespace", metavar="NAME",
+                     help="Value for '{namespace}' in query templates; selects "
+                          "the environment (default: \"default_namespace\" "
+                          "from the config)")
+    qry.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                     help="Value for a '{name}' placeholder in the query "
+                          "template. Repeat one name with different values "
+                          "(e.g. several rowkeys) to run the query once per "
+                          "value in a single shell session")
+    qry.add_argument("--from-file", metavar="FILE",
+                     help="Skip execution; parse a captured result file "
+                          "instead ('-' reads stdin)")
+
+    out = ap.add_argument_group("output")
+    out.add_argument("--csv", action="store_true",
+                     help="CSV instead of an aligned text table")
+    out.add_argument("--vertical", action="store_true",
+                     help="One cell per line, one block per row key "
+                          "(like MySQL's \\G)")
+    out.add_argument("--skip-missing", action="store_true",
+                     help="With --vertical: omit columns a row has no value for")
+    out.add_argument("--columns", metavar="A,B,...",
+                     help="Columns to display: comma-separated bare qualifiers "
+                          "(family prefix added automatically), full "
+                          "cf:qualifier names, and/or \"column_groups\" names "
+                          "from the config")
+    out.add_argument("--all-columns", action="store_true",
+                     help="Show every column found in the result, ignoring the "
+                          "configured column list")
+    out.add_argument("--rowkey", default="row", metavar="LABEL",
+                     help="Row key label for 'get' results, which don't "
+                          "include one (default: %(default)s)")
+
+    run = ap.add_argument_group("execution")
+    run.add_argument("--timeout", type=int, default=120, metavar="SECONDS",
+                     help="Timeout for the whole shell session, covering all "
+                          "repeated-param queries (default: %(default)s)")
+
     args = ap.parse_args()
 
+    if args.csv and args.vertical:
+        die("--csv and --vertical are mutually exclusive.")
     if args.skip_missing and not args.vertical:
         die("--skip-missing only applies to --vertical output.")
 
