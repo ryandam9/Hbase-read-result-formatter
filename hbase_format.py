@@ -27,12 +27,24 @@ Config file (default: config.yaml next to this script; JSON also accepted):
     tables:
       user_table:
         # Columns: a YAML list, or a whitespace-separated block (handy
-        # for tables with hundreds of columns - no quotes or commas):
+        # for tables with hundreds of columns - no quotes or commas).
+        # Omit entirely (or set to `auto`) to display whatever columns
+        # come back in the result, in first-seen order.
         columns: >
           cf1:col1 cf1:col2
+        # Optional named groups, selectable at run time via --columns:
+        column_groups:
+          basic: cf1:col1
         queries:
           get_by_key: get '{namespace}:user_table', '{rowkey}'
           scan_all: scan '{namespace}:user_table'
+
+Column display is controlled at run time with:
+    --columns a,b,...   comma-separated column names (family prefix
+                        optional if unambiguous) and/or group names
+    --all-columns       ignore the configured list; show every column
+                        found in the result
+    --skip-missing      vertical mode: omit cells absent from a row
 
 '{namespace}' in a query template is filled from --namespace, falling
 back to "default_namespace" in the config. Other '{name}' placeholders
@@ -163,7 +175,8 @@ def render_table(rows, row_order, columns, missing="-", row_label="ROW"):
     return "\n".join(out)
 
 
-def render_vertical(rows, row_order, columns, missing="-", row_label="ROW"):
+def render_vertical(rows, row_order, columns, missing="-", row_label="ROW",
+                    skip_missing=False):
     """Render one cell per line, one block per row key (like MySQL's \\G)."""
     names = [display_name(c) for c in columns]
     width = max(len(n) for n in names)
@@ -173,6 +186,7 @@ def render_vertical(rows, row_order, columns, missing="-", row_label="ROW"):
         lines.extend(
             f"  {name.ljust(width)} : {rows[rk].get(col, missing)}"
             for col, name in zip(columns, names)
+            if not skip_missing or col in rows[rk]
         )
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
@@ -347,6 +361,46 @@ def normalize_columns(cols):
     return list(cols)
 
 
+def discover_columns(rows, row_order):
+    """All columns present in the parsed result, in first-seen order."""
+    seen = []
+    for rk in row_order:
+        for c in rows[rk]:
+            if c not in seen:
+                seen.append(c)
+    return seen
+
+
+def resolve_columns(spec, groups, available):
+    """Expand a --columns spec (comma-separated column and group names)
+    against the named groups and the available columns. A bare name
+    without a family prefix matches an available column by qualifier."""
+    by_display = {}
+    for c in available:
+        by_display.setdefault(display_name(c), c)
+
+    out = []
+    for token in (t.strip() for t in spec.split(",")):
+        if not token:
+            continue
+        if token in groups:
+            out.extend(groups[token])
+        elif ":" in token:
+            out.append(token)
+        elif token in by_display:
+            out.append(by_display[token])
+        else:
+            hint = f" Groups: {', '.join(groups)}." if groups else ""
+            die(f"Unknown column or group '{token}'. "
+                f"Available columns: {', '.join(available) or '(none)'}.{hint}")
+
+    deduped = []
+    for c in out:
+        if c not in deduped:
+            deduped.append(c)
+    return deduped
+
+
 def main():
     ap = argparse.ArgumentParser(description="Execute and format HBase get/scan results.")
     ap.add_argument("--config", default=default_config_path(),
@@ -364,14 +418,25 @@ def main():
                     help="Skip execution; parse a captured result file instead ('-' for stdin)")
     ap.add_argument("--rowkey", default="row",
                     help="Row key label for 'get' results, which don't include one")
+    ap.add_argument("--columns", metavar="A,B,...",
+                    help="Comma-separated column names (family prefix optional "
+                         "if unambiguous) and/or column group names to display")
+    ap.add_argument("--all-columns", action="store_true",
+                    help="Show every column found in the result, ignoring the "
+                         "configured column list")
     fmt = ap.add_mutually_exclusive_group()
     fmt.add_argument("--csv", action="store_true", help="Output CSV instead of a text table")
     fmt.add_argument("--vertical", action="store_true",
                      help="Output one cell per line, one block per row key")
+    ap.add_argument("--skip-missing", action="store_true",
+                    help="Vertical mode: omit columns a row has no value for")
     ap.add_argument("--timeout", type=int, default=120,
                     help="Timeout in seconds for the whole shell session "
                          "(covers all repeated-param queries)")
     args = ap.parse_args()
+
+    if args.skip_missing and not args.vertical:
+        die("--skip-missing only applies to --vertical output.")
 
     cfg = load_config(args.config)
     tables = cfg["tables"]
@@ -379,9 +444,19 @@ def main():
         die(f"Table '{args.table}' not in config. Available: {', '.join(tables)}")
     table_cfg = tables[args.table]
 
-    columns = normalize_columns(table_cfg.get("columns") or [])
-    if not columns:
-        die(f"No \"columns\" defined for table '{args.table}' in config.")
+    # Column display: an explicit config list, or auto-discovery from the
+    # result (columns omitted / set to "auto", or --all-columns).
+    cols_cfg = table_cfg.get("columns")
+    auto_columns = (
+        args.all_columns
+        or not cols_cfg
+        or (isinstance(cols_cfg, str) and cols_cfg.strip().lower() == "auto")
+    )
+    configured_columns = [] if auto_columns else normalize_columns(cols_cfg)
+    column_groups = {
+        name: normalize_columns(v)
+        for name, v in (table_cfg.get("column_groups") or {}).items()
+    }
 
     param_values = {}
     for item in args.param:
@@ -457,11 +532,16 @@ def main():
         sys.stderr.write("No cells found in the result. (0 rows, or unrecognized output format.)\n")
         sys.exit(0)
 
+    columns = discover_columns(rows, row_order) if auto_columns else configured_columns
+    if args.columns:
+        columns = resolve_columns(args.columns, column_groups, columns)
+
     row_label = str(cfg.get("row_label", "ROW"))
     if args.csv:
         print(render_csv(rows, row_order, columns, row_label=row_label))
     elif args.vertical:
-        print(render_vertical(rows, row_order, columns, row_label=row_label))
+        print(render_vertical(rows, row_order, columns, row_label=row_label,
+                              skip_missing=args.skip_missing))
     else:
         print(render_table(rows, row_order, columns, row_label=row_label))
 

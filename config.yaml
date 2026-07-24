@@ -14,8 +14,13 @@ tables:
   user_table:
     # Columns can be a whitespace-separated block (easiest for wide
     # tables - no quotes, commas, or dashes needed) ...
+    # Omit this key (or set it to `auto`) to display whatever columns
+    # come back in the result instead of a fixed list.
     columns: >
       cf1:col1 cf1:col2 cf1:col3
+    # Optional named groups for run-time selection: --columns basic
+    column_groups:
+      basic: cf1:col1 cf1:col2
     queries:
       get_by_key: get '{namespace}:user_table', '{rowkey}'
       scan_all: scan '{namespace}:user_table'
