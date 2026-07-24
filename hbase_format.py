@@ -145,9 +145,9 @@ def display_name(column):
     return column.split(":", 1)[1] if ":" in column else column
 
 
-def render_table(rows, row_order, columns, missing="-"):
-    """Render an aligned text table: first column ROW, then given columns."""
-    headers = ["ROW"] + [display_name(c) for c in columns]
+def render_table(rows, row_order, columns, missing="-", row_label="ROW"):
+    """Render an aligned text table: row-key column first, then given columns."""
+    headers = [row_label] + [display_name(c) for c in columns]
     body = [[rk] + [rows[rk].get(c, missing) for c in columns] for rk in row_order]
 
     widths = [len(h) for h in headers]
@@ -163,13 +163,13 @@ def render_table(rows, row_order, columns, missing="-"):
     return "\n".join(out)
 
 
-def render_vertical(rows, row_order, columns, missing="-"):
+def render_vertical(rows, row_order, columns, missing="-", row_label="ROW"):
     """Render one cell per line, one block per row key (like MySQL's \\G)."""
     names = [display_name(c) for c in columns]
     width = max(len(n) for n in names)
     blocks = []
     for rk in row_order:
-        lines = [f"ROW: {rk}"]
+        lines = [f"{row_label}: {rk}"]
         lines.extend(
             f"  {name.ljust(width)} : {rows[rk].get(col, missing)}"
             for col, name in zip(columns, names)
@@ -178,13 +178,13 @@ def render_vertical(rows, row_order, columns, missing="-"):
     return "\n\n".join(blocks)
 
 
-def render_csv(rows, row_order, columns, missing=""):
+def render_csv(rows, row_order, columns, missing="", row_label="ROW"):
     import csv
     import io
 
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["ROW"] + [display_name(c) for c in columns])
+    w.writerow([row_label] + [display_name(c) for c in columns])
     for rk in row_order:
         w.writerow([rk] + [rows[rk].get(c, missing) for c in columns])
     return buf.getvalue().rstrip("\n")
@@ -457,12 +457,13 @@ def main():
         sys.stderr.write("No cells found in the result. (0 rows, or unrecognized output format.)\n")
         sys.exit(0)
 
+    row_label = str(cfg.get("row_label", "ROW"))
     if args.csv:
-        print(render_csv(rows, row_order, columns))
+        print(render_csv(rows, row_order, columns, row_label=row_label))
     elif args.vertical:
-        print(render_vertical(rows, row_order, columns))
+        print(render_vertical(rows, row_order, columns, row_label=row_label))
     else:
-        print(render_table(rows, row_order, columns))
+        print(render_table(rows, row_order, columns, row_label=row_label))
 
 
 if __name__ == "__main__":

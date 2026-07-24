@@ -7,6 +7,9 @@
 hbase_shell_cmd: hbase shell -n
 default_namespace: default
 
+# Label for the row-key column/heading in all output formats.
+row_label: rowkey
+
 tables:
   user_table:
     # Columns can be a whitespace-separated block (easiest for wide
