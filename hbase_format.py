@@ -9,8 +9,15 @@ or a vertical one-cell-per-line listing.
 Usage:
     python hbase_format.py --table user_table --namespace prod --query scan_all
     python hbase_format.py --table user_table --query get_by_key --param rowkey=row_key_1
+    python hbase_format.py --table user_table --query get_by_key \
+        --param rowkey=rk1 --param rowkey=rk2 --param rowkey=rk3
     python hbase_format.py --table user_table --from-file result.txt --vertical
     cat result.txt | python hbase_format.py --table user_table --from-file -
+
+Repeating one --param with different values (typically rowkey) runs the
+query once per value, batched into a single hbase shell session, and
+merges the results into one output; each 'get' result is labeled with
+its own row key value.
 
 Config file (default: config.yaml next to this script; JSON also accepted):
 
@@ -234,6 +241,36 @@ def build_query(table_cfg, table_name, query_name, params):
     return query
 
 
+# Printed via `puts` between batched queries so the combined shell output
+# can be split back into one segment per query. The label after the prefix
+# becomes the row key label for that segment's 'get' results.
+MARKER_PREFIX = "@@HBASE_FMT@@ "
+
+
+def build_batch_script(labeled_queries):
+    """Interleave marker `puts` lines with queries for one shell session."""
+    lines = []
+    for label, query in labeled_queries:
+        lines.append(f"puts '{MARKER_PREFIX}{escape_param(label)}'")
+        lines.append(query)
+    return "\n".join(lines)
+
+
+def split_on_markers(output, fallback_label):
+    """Split combined shell output into [(label, text)] per marker.
+    Text before the first marker (startup noise) gets the fallback label."""
+    segments = []
+    label, buf = fallback_label, []
+    for line in output.splitlines():
+        if line.startswith(MARKER_PREFIX):
+            segments.append((label, "\n".join(buf)))
+            label, buf = line[len(MARKER_PREFIX):], []
+        else:
+            buf.append(line)
+    segments.append((label, "\n".join(buf)))
+    return segments
+
+
 def run_query(shell_cmd, query, timeout):
     cmd = shlex.split(shell_cmd)
     try:
@@ -320,7 +357,9 @@ def main():
                     help="Value for '{namespace}' in query templates "
                          "(default: \"default_namespace\" from the config)")
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
-                    help="Placeholder value for the query template (repeatable)")
+                    help="Placeholder value for the query template. Repeat one "
+                         "name with different values (e.g. several rowkeys) to "
+                         "run the query once per value in a single shell session.")
     ap.add_argument("--from-file", metavar="FILE",
                     help="Skip execution; parse a captured result file instead ('-' for stdin)")
     ap.add_argument("--rowkey", default="row",
@@ -329,7 +368,9 @@ def main():
     fmt.add_argument("--csv", action="store_true", help="Output CSV instead of a text table")
     fmt.add_argument("--vertical", action="store_true",
                      help="Output one cell per line, one block per row key")
-    ap.add_argument("--timeout", type=int, default=120, help="Query timeout in seconds")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="Timeout in seconds for the whole shell session "
+                         "(covers all repeated-param queries)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -342,21 +383,39 @@ def main():
     if not columns:
         die(f"No \"columns\" defined for table '{args.table}' in config.")
 
-    params = {}
+    param_values = {}
     for item in args.param:
         if "=" not in item:
             die(f"--param must be NAME=VALUE, got: {item}")
         k, v = item.split("=", 1)
-        params[k] = v
+        param_values.setdefault(k, []).append(v)
 
+    multi = {k: vs for k, vs in param_values.items() if len(vs) > 1}
+    if len(multi) > 1:
+        die(f"Only one --param may be repeated with different values; "
+            f"got multiple values for: {', '.join(multi)}")
+
+    params = {k: vs[0] for k, vs in param_values.items()}
     namespace = args.namespace or cfg.get("default_namespace")
     if namespace is not None:
         params.setdefault("namespace", str(namespace))
 
-    # If the user passed a rowkey param, reuse it as the label for get results.
-    rowkey_label = params.get("rowkey", args.rowkey)
+    # One param set per execution: the repeated param (if any) varies,
+    # everything else stays fixed.
+    if multi:
+        (vary_key, values), = multi.items()
+        param_sets = [dict(params, **{vary_key: v}) for v in values]
+    else:
+        param_sets = [params]
+
+    # If the user passed a rowkey param, reuse it as the label for get
+    # results, which don't include a row key in the shell output.
+    def rowkey_label(ps):
+        return ps.get("rowkey", args.rowkey)
 
     if args.from_file:
+        if multi:
+            die("Repeated --param values cannot be combined with --from-file.")
         if args.from_file == "-":
             raw = sys.stdin.read()
         else:
@@ -364,12 +423,31 @@ def main():
             if not p.exists():
                 die(f"Result file not found: {p}")
             raw = p.read_text()
+        segments = [(rowkey_label(params), raw)]
     else:
         shell_cmd = cfg.get("hbase_shell_cmd", "hbase shell -n")
-        query = build_query(table_cfg, args.table, args.query, params)
-        raw = run_query(shell_cmd, query, args.timeout)
+        queries = [build_query(table_cfg, args.table, args.query, ps)
+                   for ps in param_sets]
+        if len(queries) == 1:
+            raw = run_query(shell_cmd, queries[0], args.timeout)
+            segments = [(rowkey_label(params), raw)]
+        else:
+            # Batch all queries into one shell session (one JVM startup),
+            # with marker lines to attribute output to each query.
+            labeled = list(zip((rowkey_label(ps) for ps in param_sets), queries))
+            raw = run_query(shell_cmd, build_batch_script(labeled), args.timeout)
+            segments = split_on_markers(raw, fallback_label=args.rowkey)
 
-    rows, row_order, unparsed = parse_result(raw, default_rowkey=rowkey_label)
+    rows, row_order, unparsed = {}, [], 0
+    for label, text in segments:
+        seg_rows, seg_order, seg_unparsed = parse_result(text, default_rowkey=label)
+        unparsed += seg_unparsed
+        for rk in seg_order:
+            if rk not in rows:
+                rows[rk] = {}
+                row_order.append(rk)
+            rows[rk].update(seg_rows[rk])
+
     if unparsed:
         sys.stderr.write(
             f"Warning: {unparsed} line(s) did not match any known format "
